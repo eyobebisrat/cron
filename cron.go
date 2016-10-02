@@ -7,6 +7,17 @@ import (
 	"runtime"
 	"sort"
 	"time"
+
+	"github.com/satori/go.uuid"
+)
+
+type JobStatus int
+
+const (
+	Error JobStatus = 0 + iota
+	Waitting
+	Paused
+	Running
 )
 
 // Cron keeps track of any number of entries, invoking the associated func as
@@ -16,10 +27,20 @@ type Cron struct {
 	entries  []*Entry
 	stop     chan struct{}
 	add      chan *Entry
+	del      chan string
+	pause    chan string
+	resume   chan string
 	snapshot chan []*Entry
+	req      chan *request
+	onFire   func(*Entry)
 	running  bool
 	ErrorLog *log.Logger
 	location *time.Location
+}
+
+type request struct {
+	id       string
+	response chan *Entry
 }
 
 // Job is an interface for submitted cron jobs.
@@ -49,6 +70,21 @@ type Entry struct {
 
 	// The Job to run.
 	Job Job
+
+	ID string
+
+	Status JobStatus
+}
+
+func (e *Entry) clone() *Entry {
+	return &Entry{
+		Schedule: e.Schedule,
+		Next:     e.Next,
+		Prev:     e.Prev,
+		Job:      e.Job,
+		ID:       e.ID,
+		Status:   e.Status,
+	}
 }
 
 // byTime is a wrapper for sorting the entry array by time
@@ -80,39 +116,63 @@ func NewWithLocation(location *time.Location) *Cron {
 	return &Cron{
 		entries:  nil,
 		add:      make(chan *Entry),
+		del:      make(chan string),
+		pause:    make(chan string),
+		resume:   make(chan string),
 		stop:     make(chan struct{}),
 		snapshot: make(chan []*Entry),
+		onFire:   nil,
 		running:  false,
 		ErrorLog: nil,
 		location: location,
 	}
 }
 
-// A wrapper that turns a func() into a cron.Job
+//FuncJob A wrapper that turns a func() into a cron.Job
 type FuncJob func()
 
+//Run implement of Job interface
 func (f FuncJob) Run() { f() }
 
+//OnFire regist fire event handler
+func (c *Cron) OnFire(f func(*Entry)) {
+	c.onFire = f
+}
+
 // AddFunc adds a func to the Cron to be run on the given schedule.
-func (c *Cron) AddFunc(spec string, cmd func()) error {
+func (c *Cron) AddFunc(spec string, cmd func()) (string, error) {
 	return c.AddJob(spec, FuncJob(cmd))
 }
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
-func (c *Cron) AddJob(spec string, cmd Job) error {
+func (c *Cron) AddJob(spec string, cmd Job) (string, error) {
+	id := uuid.NewV4().String()
+	err := c.AddJobWithID(spec, cmd, id)
+	return id, err
+}
+
+//AddJobWithID adds a Job to the Cron to be run on the given schedule with id.
+func (c *Cron) AddJobWithID(spec string, cmd Job, id string) error {
 	schedule, err := Parse(spec)
 	if err != nil {
 		return err
 	}
-	c.Schedule(schedule, cmd)
+	c.Schedule(schedule, cmd, id)
 	return nil
 }
 
+//AddFuncWithID adds a func to the Cron to be run on the given schedule with given id
+func (c *Cron) AddFuncWithID(spec string, cmd func(), id string) error {
+	return c.AddJobWithID(spec, FuncJob(cmd), id)
+}
+
 // Schedule adds a Job to the Cron to be run on the given schedule.
-func (c *Cron) Schedule(schedule Schedule, cmd Job) {
+func (c *Cron) Schedule(schedule Schedule, cmd Job, id string) {
 	entry := &Entry{
 		Schedule: schedule,
 		Job:      cmd,
+		ID:       id,
+		Status:   Waitting,
 	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
@@ -120,6 +180,76 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) {
 	}
 
 	c.add <- entry
+}
+
+//RemoveJob remove the job with the given id
+func (c *Cron) RemoveJob(id string) {
+	if !c.running {
+		c.removeJob(id)
+	} else {
+		c.del <- id
+	}
+}
+
+func (c *Cron) removeJob(id string) {
+	w := 0 // write index
+	for _, x := range c.entries {
+		if id == x.ID {
+			continue
+		}
+		c.entries[w] = x
+		w++
+	}
+	c.entries = c.entries[:w]
+}
+
+func (c *Cron) Entry(id string) (*Entry, bool) {
+	if c.running {
+		e, ok := c.entry(id)
+		if ok {
+			return e.clone(), true
+		}
+		return nil, false
+	}
+	resp := make(chan *Entry)
+	c.req <- &request{id, resp}
+	e := <-resp
+	close(resp)
+	return e, e != nil
+}
+
+func (c *Cron) entry(id string) (*Entry, bool) {
+	for _, x := range c.entries {
+		if id == x.ID {
+			return x, true
+		}
+	}
+	return nil, false
+}
+
+//PauseJob pause job with the given id
+func (c *Cron) PauseJob(id string) {
+	if !c.running {
+		c.setJobStatus(id, Paused)
+	} else {
+		c.pause <- id
+	}
+}
+
+//ResumeJob resume the job with the given id
+func (c *Cron) ResumeJob(id string) {
+	if !c.running {
+		c.setJobStatus(id, Waitting)
+		return
+	}
+	c.resume <- id
+}
+
+func (c *Cron) setJobStatus(id string, s JobStatus) {
+	e, ok := c.entry(id)
+	if ok {
+		e.Status = s
+	}
 }
 
 // Entries returns a snapshot of the cron entries.
@@ -146,7 +276,22 @@ func (c *Cron) Start() {
 	go c.run()
 }
 
-func (c *Cron) runWithRecovery(j Job) {
+// func (c *Cron) runWithRecovery(j Job) {
+// 	defer func() {
+// 		if r := recover(); r != nil {
+// 			const size = 64 << 10
+// 			buf := make([]byte, size)
+// 			buf = buf[:runtime.Stack(buf, false)]
+// 			c.logf("cron: panic running job: %v\n%s", r, buf)
+// 		}
+// 	}()
+// 	j.Run()
+// }
+
+func (c *Cron) runWithRecovery(e *Entry) {
+	if e.Status != Waitting {
+		return
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			const size = 64 << 10
@@ -154,8 +299,13 @@ func (c *Cron) runWithRecovery(j Job) {
 			buf = buf[:runtime.Stack(buf, false)]
 			c.logf("cron: panic running job: %v\n%s", r, buf)
 		}
+		e.Status = Waitting
 	}()
-	j.Run()
+	e.Status = Running
+	if c.onFire != nil {
+		c.onFire(e.clone())
+	}
+	e.Job.Run()
 }
 
 // Run the scheduler.. this is private just due to the need to synchronize
@@ -183,15 +333,14 @@ func (c *Cron) run() {
 		timer := time.NewTimer(effective.Sub(now))
 		select {
 		case now = <-timer.C:
-			now = now.In(c.location)
 			// Run every entry whose next time was this effective time.
 			for _, e := range c.entries {
 				if e.Next != effective {
 					break
 				}
-				go c.runWithRecovery(e.Job)
 				e.Prev = e.Next
 				e.Next = e.Schedule.Next(now)
+				go c.runWithRecovery(e)
 			}
 			continue
 
@@ -199,6 +348,18 @@ func (c *Cron) run() {
 			c.entries = append(c.entries, newEntry)
 			newEntry.Next = newEntry.Schedule.Next(time.Now().In(c.location))
 
+		case id := <-c.del:
+			c.removeJob(id)
+
+		case id := <-c.pause:
+			c.setJobStatus(id, Paused)
+
+		case id := <-c.resume:
+			c.setJobStatus(id, Waitting)
+
+		case req := <-c.req:
+			e, _ := c.entry(req.id)
+			req.response <- e.clone()
 		case <-c.snapshot:
 			c.snapshot <- c.entrySnapshot()
 
@@ -235,12 +396,7 @@ func (c *Cron) Stop() {
 func (c *Cron) entrySnapshot() []*Entry {
 	entries := []*Entry{}
 	for _, e := range c.entries {
-		entries = append(entries, &Entry{
-			Schedule: e.Schedule,
-			Next:     e.Next,
-			Prev:     e.Prev,
-			Job:      e.Job,
-		})
+		entries = append(entries, e.clone())
 	}
 	return entries
 }

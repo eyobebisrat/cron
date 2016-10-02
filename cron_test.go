@@ -2,15 +2,150 @@ package cron
 
 import (
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	uuid "github.com/satori/go.uuid"
 )
 
 // Many tests schedule a job for every second, and then wait at most a second
 // for it to run.  This amount is just slightly larger than 1 second to
 // compensate for a few milliseconds of runtime.
 const ONE_SECOND = 1*time.Second + 10*time.Millisecond
+
+func TestFireBlokc(t *testing.T) {
+	wg := &sync.WaitGroup{}
+	wg.Add(20)
+
+	cron := New()
+	cron.Start()
+	defer cron.Stop()
+	// idx := 0
+
+	cron.AddJob("0/1 * * * * ?", testJob{wg, "job"})
+
+	select {
+	case <-time.After(40 * ONE_SECOND):
+		t.FailNow()
+	case <-wait(wg):
+		fmt.Println("Success")
+		return
+	}
+
+}
+
+/*
+func TestQueryExistEntity(t *testing.T) {
+	wg := &sync.WaitGroup{}
+	cron := New()
+	cron.Start()
+	defer cron.Stop()
+	id, _ := cron.AddFunc("0/5 * * * * ?", func() { fmt.Println("tick!") })
+	fmt.Println("start")
+
+	for i := 0; i < 100; i++ {
+		// fmt.Println("Loop", i)
+		go func() {
+			wg.Add(1)
+			for j := 0; j < 1000; j++ {
+				time.Sleep(time.Microsecond * 10)
+				e, exist := cron.Entry(id)
+				if e.ID != id || !exist {
+					fmt.Println("failed", i, j)
+					t.FailNow()
+				} else {
+					fmt.Println("get entry ", i, j, e.ID, e.Status)
+				}
+			}
+			fmt.Println("go func done ", i)
+			wg.Done()
+
+		}()
+		time.Sleep(50 * time.Microsecond)
+	}
+
+	wg.Wait()
+	fmt.Println("end of function")
+}
+
+*/
+
+func nextTenSecondSpec() string {
+	s := time.Now().Second()
+	s += 10
+	s = s % 60
+	st := strconv.FormatInt(int64(s), 10) + " * * * * ?"
+	return st
+}
+
+func TestResumeJobWhileRunning(t *testing.T) {
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	cron := New()
+	defer cron.Stop()
+	spec := nextTenSecondSpec()
+	cron.Start()
+	id, _ := cron.AddJob(spec, testJob{wg, "Job"})
+	time.Sleep(ONE_SECOND)
+	cron.ResumeJob(id)
+
+	select {
+	case <-time.After(15 * ONE_SECOND):
+		t.FailNow()
+	case <-wait(wg):
+		fmt.Println("TestResumeJobWhileRunning: Ok")
+		return
+	}
+
+}
+
+func TestPauseJobWhileRunning(t *testing.T) {
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+
+	cron := New()
+	defer cron.Stop()
+	now := time.Now()
+	s := now.Second() + 10
+	s = s % 60
+	spec := strconv.FormatInt(int64(s), 10) + " * * * * ?"
+	fmt.Println(now, spec)
+	id, _ := cron.AddJob(spec, testJob{wg, "job1"})
+	cron.Start()
+
+	time.Sleep(ONE_SECOND)
+	cron.PauseJob(id)
+
+	select {
+	case <-time.After(15 * ONE_SECOND):
+	// nothing
+	case <-wait(wg):
+		t.FailNow()
+	}
+
+}
+
+func TestPauseJob(t *testing.T) {
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+
+	cron := New()
+	defer cron.Stop()
+	id, _ := cron.AddJob("* * * * * ?", testJob{wg, "job1"})
+	cron.PauseJob(id)
+	cron.Start()
+	// time.Sleep(ONE_SECOND)
+	select {
+	case <-time.After(ONE_SECOND):
+		//nothing
+	case <-wait(wg):
+		t.FailNow()
+	}
+
+}
 
 func TestFuncPanicRecovery(t *testing.T) {
 	cron := New()
@@ -68,6 +203,7 @@ func TestStopCausesJobsToNotRun(t *testing.T) {
 
 	select {
 	case <-time.After(ONE_SECOND):
+		t.Log("time after one second")
 		// No job ran!
 	case <-wait(wg):
 		t.FailNow()
@@ -202,9 +338,9 @@ func TestRunningMultipleSchedules(t *testing.T) {
 	cron.AddFunc("0 0 0 1 1 ?", func() {})
 	cron.AddFunc("0 0 0 31 12 ?", func() {})
 	cron.AddFunc("* * * * * ?", func() { wg.Done() })
-	cron.Schedule(Every(time.Minute), FuncJob(func() {}))
-	cron.Schedule(Every(time.Second), FuncJob(func() { wg.Done() }))
-	cron.Schedule(Every(time.Hour), FuncJob(func() {}))
+	cron.Schedule(Every(time.Minute), FuncJob(func() {}), uuid.NewV4().String())
+	cron.Schedule(Every(time.Second), FuncJob(func() { wg.Done() }), uuid.NewV4().String())
+	cron.Schedule(Every(time.Hour), FuncJob(func() {}), uuid.NewV4().String())
 
 	cron.Start()
 	defer cron.Stop()
@@ -219,11 +355,11 @@ func TestRunningMultipleSchedules(t *testing.T) {
 // Test that the cron is run in the local time zone (as opposed to UTC).
 func TestLocalTimezone(t *testing.T) {
 	wg := &sync.WaitGroup{}
-	wg.Add(2)
+	wg.Add(1)
 
 	now := time.Now().Local()
-	spec := fmt.Sprintf("%d,%d %d %d %d %d ?",
-		now.Second()+1, now.Second()+2, now.Minute(), now.Hour(), now.Day(), now.Month())
+	spec := fmt.Sprintf("%d %d %d %d %d ?",
+		now.Second()+1, now.Minute(), now.Hour(), now.Day(), now.Month())
 
 	cron := New()
 	cron.AddFunc(spec, func() { wg.Done() })
@@ -231,7 +367,7 @@ func TestLocalTimezone(t *testing.T) {
 	defer cron.Stop()
 
 	select {
-	case <-time.After(ONE_SECOND * 2):
+	case <-time.After(ONE_SECOND):
 		t.FailNow()
 	case <-wait(wg):
 	}
@@ -240,7 +376,7 @@ func TestLocalTimezone(t *testing.T) {
 // Test that the cron is run in the given time zone (as opposed to local).
 func TestNonLocalTimezone(t *testing.T) {
 	wg := &sync.WaitGroup{}
-	wg.Add(2)
+	wg.Add(1)
 
 	loc, err := time.LoadLocation("Atlantic/Cape_Verde")
 	if err != nil {
@@ -249,8 +385,8 @@ func TestNonLocalTimezone(t *testing.T) {
 	}
 
 	now := time.Now().In(loc)
-	spec := fmt.Sprintf("%d,%d %d %d %d %d ?",
-		now.Second()+1, now.Second()+2, now.Minute(), now.Hour(), now.Day(), now.Month())
+	spec := fmt.Sprintf("%d %d %d %d %d ?",
+		now.Second()+1, now.Minute(), now.Hour(), now.Day(), now.Month())
 
 	cron := NewWithLocation(loc)
 	cron.AddFunc(spec, func() { wg.Done() })
@@ -258,7 +394,7 @@ func TestNonLocalTimezone(t *testing.T) {
 	defer cron.Stop()
 
 	select {
-	case <-time.After(ONE_SECOND * 2):
+	case <-time.After(ONE_SECOND):
 		t.FailNow()
 	case <-wait(wg):
 	}
@@ -277,6 +413,7 @@ type testJob struct {
 }
 
 func (t testJob) Run() {
+	fmt.Println(t.name)
 	t.wg.Done()
 }
 
@@ -290,8 +427,8 @@ func TestJob(t *testing.T) {
 	cron.AddJob("0 0 0 1 1 ?", testJob{wg, "job1"})
 	cron.AddJob("* * * * * ?", testJob{wg, "job2"})
 	cron.AddJob("1 0 0 1 1 ?", testJob{wg, "job3"})
-	cron.Schedule(Every(5*time.Second+5*time.Nanosecond), testJob{wg, "job4"})
-	cron.Schedule(Every(5*time.Minute), testJob{wg, "job5"})
+	cron.Schedule(Every(5*time.Second+5*time.Nanosecond), testJob{wg, "job4"}, uuid.NewV4().String())
+	cron.Schedule(Every(5*time.Minute), testJob{wg, "job5"}, uuid.NewV4().String())
 
 	cron.Start()
 	defer cron.Stop()
