@@ -146,7 +146,8 @@ func (c *Cron) AddFunc(spec string, cmd func()) (string, error) {
 
 // AddJob adds a Job to the Cron to be run on the given schedule.
 func (c *Cron) AddJob(spec string, cmd Job) (string, error) {
-	id := uuid.NewV4().String()
+	idV4 , _:= uuid.NewV4()
+	id := idv4.String()
 	err := c.AddJobWithID(spec, cmd, id)
 	return id, err
 }
